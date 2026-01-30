@@ -323,7 +323,7 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 				if (i >= ctx->t.pic_width_in_mbs) // B available
 					t = loada128(PX(0, -1));
 			}
-			i8x16 dcY = broadcast8(shrru16(sumd8(t, l), 5), __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
+			i8x16 dcY = broadcast8(shrru16(sum8(t) + sum8(l), 5), 0);
 			#if defined(__SSE2__)
 				i8x16 w = (p128 < 128) ? ziplo8(set8(128 - p128), set8(p128)) : (i8x16){0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
 				i64x2 wd = {p128 < 128 ? 7 : 0};
@@ -352,8 +352,8 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 				INIT_PX(ctx->samples_mb[1], ctx->t.stride[1] >> 1);
 				i8x16 b = ziplo64(loada64(PX(0, -2)), ldleft8(0, 2, 4, 6, 8, 10, 12, 14));
 				i8x16 r = ziplo64(loada64(PX(0, -1)), ldleft8(1, 3, 5, 7, 9, 11, 13, 15));
-				i8x16 dcb = broadcast8(shrru16(sum8(b), 4), __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
-				i8x16 dcr = broadcast8(shrru16(sum8(r), 4), __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
+				i8x16 dcb = broadcast8(shrru16(sum8(b), 4), 0);
+				i8x16 dcr = broadcast8(shrru16(sum8(r), 4), 0);
 				i8x16 dcC = ziplo64(dcb, dcr);
 				i64x2 v0 = maddshrL(loada64x2(PX(0, 0), PX(0, 1)), dcC, w, o, wd);
 				i64x2 v1 = maddshrL(loada64x2(PX(0, 2), PX(0, 3)), dcC, w, o, wd);
@@ -443,6 +443,23 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		// wait until a task becomes available and reserve it
 		while (c.thread_id >= 0 && !c.d->ready_tasks)
 			pthread_cond_wait(&c.d->task_ready, &c.d->lock);
+		// For single-threaded mode, if no tasks are ready, update ready_tasks
+		// This handles MVC where dependent view tasks may have their dependencies
+		// satisfied by frames decoded in previous calls but not yet marked ready
+		if (!c.d->ready_tasks) {
+			for (int i = 0; i < 16; i++) {
+				if ((c.d->pending_tasks >> i) & 1) {
+					if ((c.d->task_dependencies[i] & ~ready_frames(c.d)) == 0)
+						c.d->ready_tasks |= 1 << i;
+				}
+			}
+		}
+		// If still no ready tasks, something is wrong - return to avoid UB
+		if (!c.d->ready_tasks) {
+			if (c.thread_id < 0)
+				return (void *)0;
+			continue; // Multi-threaded: wait for condition
+		}
 		int task_id = __builtin_ctz(c.d->ready_tasks); // FIXME arbitrary selection for now
 		int currPic = c.d->taskPics[task_id];
 		c.d->pending_tasks &= ~(1 << task_id);
@@ -1249,7 +1266,12 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	dec->busy_tasks |= 1 << task_id;
 	dec->pending_tasks |= 1 << task_id;
 	dec->task_dependencies[task_id] = refs_to_mask(t);
-	dec->ready_tasks |= ((dec->task_dependencies[task_id] & ~ready_frames(dec)) == 0) << task_id;
+	// For single-threaded mode, always mark the task as ready since we process
+	// slices sequentially and dependencies should already be satisfied
+	if (dec->n_threads)
+		dec->ready_tasks |= ((dec->task_dependencies[task_id] & ~ready_frames(dec)) == 0) << task_id;
+	else
+		dec->ready_tasks |= 1 << task_id;
 	dec->taskPics[task_id] = dec->currPic;
 	ret = print_dec(dec, dec->n_threads || dec->worker_loop != worker_loop_log ?
 		"  nal_res: %s\n" : t->pps.entropy_coding_mode_flag ?
