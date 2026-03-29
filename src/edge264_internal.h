@@ -155,6 +155,7 @@ typedef struct {
 	int8_t dpb_output_delay_length; // 1..32
 	int8_t time_offset_length; // 0..31
 	int8_t pic_struct_present_flag; // 0..1
+	int8_t seq_scaling_matrix_present_flag; // 0..1
 	uint16_t pic_width_in_mbs; // 1..1023
 	int16_t pic_height_in_mbs; // 1..1055
 	int16_t offset_for_non_ref_pic; // -32768..32767, pic_order_cnt_type==1
@@ -336,6 +337,7 @@ typedef struct Edge264Decoder {
 	// minimal set of fields preserved across flushes
 	Edge264GetBits gb; // must be first in the struct to use the same pointer for bitstream functions
 	int8_t n_threads; // 0 to disable multithreading
+	volatile int8_t shutdown; // set to 1 to signal worker threads to exit
 	int8_t nal_unit_type; // 5 significant bits
 	int32_t plane_size_Y;
 	int32_t plane_size_C;
@@ -385,6 +387,26 @@ typedef struct Edge264Decoder {
 	int32_t FrameNums[32]; // signed to be used along FieldOrderCnt in initial reference ordering
 	int32_t FrameIds[32]; // unique identifiers for each frame, incremented in decoding order
 	union { int8_t get_frame_queue[2][16]; i8x16 get_frame_queue_v[2]; }; // FIFO with insertion at 0 for both views, and empty slots having value -1
+	union { int8_t mvc_reorder_base[16]; i8x16 mvc_reorder_base_v; }; // matched MVC base pics waiting for final reorder output
+	union { int8_t mvc_reorder_dep[16]; i8x16 mvc_reorder_dep_v; }; // matched MVC dep pics waiting for final reorder output
+	int64_t mvc_reorder_key[16]; // frozen display-order key for each matched MVC pair
+	int64_t MvcLifecycleOrder[32]; // per-picture absolute MVC display-order key assigned at picture admission
+	int32_t MvcPicOrderCntLsb[32];
+	int8_t HaveMvcPicOrderCntLsb[32];
+	int64_t MvcPrevRefPicOrderCntMsb[2];
+	int32_t MvcPrevRefPicOrderCntLsb[2];
+	int8_t HaveMvcPrevRefPicOrderCnt[2];
+	int8_t MvcOrderHavePrevPocLsb;
+	int32_t MvcOrderPrevPocLsb;
+	int64_t MvcOrderPrevPocMsb;
+	int8_t MvcOrderHaveLastAssigned;
+	int32_t MvcOrderLastAssignedPocLsb;
+	int64_t MvcOrderLastAssignedKey;
+	int8_t MvcOrderHaveEpoch;
+	int64_t MvcOrderEpochBase;
+	int64_t MvcOrderEpochMaxRelativeOrder;
+	int8_t HaveMvcReorderStarted;
+	uint32_t mvc_last_empty_sig; // last MVC queue signature logged while reorder queue was empty
 	union { int8_t LongTermFrameIdx[32]; i8x16 LongTermFrameIdx_v[2]; };
 	union { int8_t prev_LongTermFrameIdx[32]; i8x16 prev_LongTermFrameIdx_v[2]; }; // state of LongTermFrameIdx before current frame
 	union { int32_t FieldOrderCnt[2][32]; i32x4 FieldOrderCnt_v[2][8]; }; // lower/higher half for top/bottom fields
@@ -1154,6 +1176,16 @@ static always_inline unsigned depended_frames(Edge264Decoder *dec) {
 	u32x4 b = a | (u32x4)shr128(a, 8);
 	u32x4 c = b | (u32x4)shr128(b, 4);
 	return c[0];
+}
+static always_inline unsigned active_task_frames(Edge264Decoder *dec) {
+	unsigned mask = 0;
+	for (unsigned tasks = dec->busy_tasks; tasks; tasks &= tasks - 1) {
+		int task_id = __builtin_ctz(tasks);
+		int pic = dec->taskPics[task_id];
+		if ((unsigned)pic < 32)
+			mask |= 1u << pic;
+	}
+	return mask;
 }
 // relative time with microsecond precision
 static always_inline uint64_t get_relative_time_us() {

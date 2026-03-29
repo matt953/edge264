@@ -75,20 +75,180 @@ static void unset_currPic(Edge264Decoder *dec) {
 	dec->currPic = -1;
 }
 
+static int64_t picture_order_key(const Edge264Decoder *dec, int pic) {
+	return dec->MvcLifecycleOrder[pic];
+}
+
+static int64_t assign_mvc_lifecycle_order(Edge264Decoder *dec, Edge264SeqParameterSet *sps, int pic_order_cnt_lsb) {
+	if (dec->MvcOrderHaveLastAssigned && pic_order_cnt_lsb == dec->MvcOrderLastAssignedPocLsb)
+		return dec->MvcOrderLastAssignedKey;
+	int64_t poc_msb = dec->MvcOrderPrevPocMsb;
+	int is_idr = dec->IdrPicFlag != 0;
+	if (is_idr || !dec->MvcOrderHavePrevPocLsb) {
+		poc_msb = 0;
+	} else if (sps->pic_order_cnt_type == 0 && sps->log2_max_pic_order_cnt_lsb > 0) {
+		int max_pic_order_cnt_lsb = 1 << sps->log2_max_pic_order_cnt_lsb;
+		if (pic_order_cnt_lsb < dec->MvcOrderPrevPocLsb &&
+		    dec->MvcOrderPrevPocLsb - pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2) {
+			poc_msb += max_pic_order_cnt_lsb;
+		} else if (pic_order_cnt_lsb > dec->MvcOrderPrevPocLsb &&
+		           pic_order_cnt_lsb - dec->MvcOrderPrevPocLsb > max_pic_order_cnt_lsb / 2) {
+			poc_msb -= max_pic_order_cnt_lsb;
+		}
+	}
+	int64_t relative_order = poc_msb + pic_order_cnt_lsb;
+	if (is_idr) {
+		if (dec->MvcOrderHaveEpoch)
+			dec->MvcOrderEpochBase += dec->MvcOrderEpochMaxRelativeOrder + 2;
+		else
+			dec->MvcOrderHaveEpoch = 1;
+		dec->MvcOrderEpochMaxRelativeOrder = -2;
+	} else if (!dec->MvcOrderHaveEpoch) {
+		dec->MvcOrderHaveEpoch = 1;
+		dec->MvcOrderEpochBase = 0;
+		dec->MvcOrderEpochMaxRelativeOrder = -2;
+	}
+	if (relative_order > dec->MvcOrderEpochMaxRelativeOrder)
+		dec->MvcOrderEpochMaxRelativeOrder = relative_order;
+	int64_t lifecycle_key = dec->MvcOrderEpochBase + relative_order;
+	dec->MvcOrderHavePrevPocLsb = 1;
+	dec->MvcOrderPrevPocLsb = pic_order_cnt_lsb;
+	dec->MvcOrderPrevPocMsb = poc_msb;
+	dec->MvcOrderHaveLastAssigned = 1;
+	dec->MvcOrderLastAssignedPocLsb = pic_order_cnt_lsb;
+	dec->MvcOrderLastAssignedKey = lifecycle_key;
+	return lifecycle_key;
+}
+
+static void queue_output_frame(Edge264Decoder *dec, int non_base_view, int pic) {
+	assert(movemask(dec->get_frame_queue_v[non_base_view]));
+	dec->output_frames |= 1 << pic;
+	dec->get_frame_queue_v[non_base_view] = shrd128(set8(pic), dec->get_frame_queue_v[non_base_view], 15);
+}
+
+static int find_queued_frame_slot(const Edge264Decoder *dec, int non_base_view, int pic) {
+	for (int i = 0; i < 16; ++i)
+		if (dec->get_frame_queue[non_base_view][i] == pic)
+			return i;
+	return -1;
+}
+
+static int queue_reorder_pair(Edge264Decoder *dec, int base_pic, int dep_pic) {
+	for (int i = 0; i < 16; ++i) {
+		if (dec->mvc_reorder_base[i] >= 0)
+			continue;
+		dec->mvc_reorder_base[i] = base_pic;
+		dec->mvc_reorder_dep[i] = dep_pic;
+		dec->mvc_reorder_key[i] = picture_order_key(dec, base_pic);
+		return 1;
+	}
+	return 0;
+}
+
+static unsigned view_mask(const Edge264Decoder *dec, int non_base_view) {
+	return non_base_view ? dec->non_base_frames : ~dec->non_base_frames;
+}
+
+static unsigned count_pending_view_frames(const Edge264Decoder *dec, int non_base_view) {
+	return __builtin_popcount(dec->to_get_frames & ~dec->output_frames & view_mask(dec, non_base_view));
+}
+
+static unsigned count_buffered_view_frames(const Edge264Decoder *dec, unsigned reference_frames, int non_base_view) {
+	unsigned same_views = view_mask(dec, non_base_view);
+	return __builtin_popcount((reference_frames & same_views) | (dec->to_get_frames & ~dec->output_frames & same_views));
+}
+
+static unsigned count_queued_view_frames(const Edge264Decoder *dec, int non_base_view) {
+	unsigned count = 0;
+	for (int i = 0; i < 16; ++i)
+		count += dec->get_frame_queue[non_base_view][i] >= 0;
+	return count;
+}
+
+static void log_mvc_queue_event(Edge264Decoder *dec, const char *source, int non_base_view, int pic, const char *result, int other_pic, const char *reason) {
+	if (!dec->ssps.BitDepth_Y || !dec->log_cb)
+		return;
+	char msg[320];
+	snprintf(msg, sizeof(msg),
+		"edge264 mvc: src=%s view=%c pic=%d key=%lld raw=%d result=%s other=%d reason=%s pending={b:%u,d:%u} queued={b:%u,d:%u}\n",
+		source, non_base_view ? 'D' : 'B', pic,
+		(long long)picture_order_key(dec, pic), dec->FieldOrderCnt[0][pic], result, other_pic, reason,
+		count_pending_view_frames(dec, 0), count_pending_view_frames(dec, 1),
+		count_queued_view_frames(dec, 0), count_queued_view_frames(dec, 1));
+	dec->log_cb(msg, dec->log_arg);
+}
+
+static int complete_queued_output_pair(Edge264Decoder *dec, const char *source, int non_base_view, int pic, int other_pic) {
+	int other_non_base_view = !non_base_view;
+	int idx = find_queued_frame_slot(dec, other_non_base_view, other_pic);
+	if (idx < 0)
+		return 0;
+	int self_idx = find_queued_frame_slot(dec, non_base_view, pic);
+	if (self_idx < 0)
+		return 0;
+	if (!queue_reorder_pair(dec, non_base_view ? other_pic : pic, non_base_view ? pic : other_pic)) {
+		log_mvc_queue_event(dec, source, non_base_view, pic, "miss", other_pic, "reorder_full");
+		return 1;
+	}
+	dec->get_frame_queue[non_base_view][self_idx] = -1;
+	dec->get_frame_queue[other_non_base_view][idx] = -1;
+	log_mvc_queue_event(dec, source, non_base_view, pic, "pair", other_pic, "completed");
+	return 1;
+}
+
+static void try_queue_matching_view_frame(Edge264Decoder *dec, const char *source, int non_base_view, int pic) {
+	if (!dec->ssps.BitDepth_Y)
+		return;
+	int other_non_base_view = !non_base_view;
+	unsigned other_views = view_mask(dec, other_non_base_view);
+	int64_t key = picture_order_key(dec, pic);
+	if (!movemask(dec->get_frame_queue_v[other_non_base_view])) {
+		log_mvc_queue_event(dec, source, non_base_view, pic, "miss", -1, "other_queue_full");
+		return;
+	}
+	for (unsigned o = dec->to_get_frames & ~dec->output_frames & other_views; o; o &= o - 1) {
+		int i = __builtin_ctz(o);
+		if (picture_order_key(dec, i) != key)
+			continue;
+		queue_output_frame(dec, other_non_base_view, i);
+		log_mvc_queue_event(dec, source, non_base_view, pic, "pair", i, "queued");
+		return;
+	}
+	int other_pic = -1;
+	int other_output = 0;
+	for (unsigned o = dec->to_get_frames & other_views; o; o &= o - 1) {
+		int i = __builtin_ctz(o);
+		if (picture_order_key(dec, i) != key)
+			continue;
+		other_pic = i;
+		other_output = !!(dec->output_frames & 1 << i);
+		break;
+	}
+	if (other_pic >= 0 && other_output) {
+		if (complete_queued_output_pair(dec, source, non_base_view, pic, other_pic))
+			return;
+		log_mvc_queue_event(dec, source, non_base_view, pic, "miss", other_pic, "already_output");
+	} else if (other_pic < 0) {
+		log_mvc_queue_event(dec, source, non_base_view, pic, "miss", -1, "not_in_dpb");
+	}
+}
+
 static int bump_frame(Edge264Decoder *dec, int non_base_view, unsigned ignored) {
 	int pic = -1;
-	int lowest_poc = INT_MAX;
-	unsigned same_views = non_base_view ? dec->non_base_frames : ~dec->non_base_frames;
+	int64_t lowest_key = INT64_MAX;
+	unsigned same_views = view_mask(dec, non_base_view);
 	for (unsigned o = dec->to_get_frames & ~dec->output_frames & same_views & ~ignored; o; o &= o - 1) {
 		int i = __builtin_ctz(o);
-		if (dec->FieldOrderCnt[0][i] < lowest_poc)
-			lowest_poc = dec->FieldOrderCnt[0][pic = i];
+		int64_t key = picture_order_key(dec, i);
+		if (key < lowest_key) {
+			lowest_key = key;
+			pic = i;
+		}
 	}
 	if (pic < 0)
 		return 0;
-	assert(movemask(dec->get_frame_queue_v[non_base_view])); // get_frame_queue should never be full
-	dec->output_frames |= 1 << pic;
-	dec->get_frame_queue_v[non_base_view] = shrd128(set8(pic), dec->get_frame_queue_v[non_base_view], 15);
+	queue_output_frame(dec, non_base_view, pic);
+	try_queue_matching_view_frame(dec, "bump", non_base_view, pic);
 	return 1;
 }
 
@@ -135,6 +295,15 @@ static void clear_decoder(Edge264Decoder *dec) {
 	dec->currPic = dec->basePic = -1;
 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = -1;
 	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
+	dec->mvc_reorder_base_v = dec->mvc_reorder_dep_v = set8(-1);
+	dec->mvc_last_empty_sig = ~0u;
+	dec->MvcOrderHavePrevPocLsb = 0;
+	dec->MvcOrderHaveLastAssigned = 0;
+	dec->MvcOrderHaveEpoch = 0;
+	dec->MvcOrderEpochBase = 0;
+	dec->MvcOrderEpochMaxRelativeOrder = -2;
+	for (int i = 0; i < 16; ++i)
+		dec->mvc_reorder_key[i] = INT64_MAX;
 }
 
 int ADD_VARIANT(parse_end_of_sequence)(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg) {
@@ -453,8 +622,10 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		pthread_mutex_lock(&c.d->lock);
 	while (1) {
 		// wait until a task becomes available and reserve it
-		while (c.thread_id >= 0 && !c.d->ready_tasks)
+		while (c.thread_id >= 0 && !c.d->ready_tasks && !c.d->shutdown)
 			pthread_cond_wait(&c.d->task_ready, &c.d->lock);
+		if (c.d->shutdown)
+			break;
 		assert((unsigned)c.d->ready_tasks - 1 < 65535); // 0 < ready_tasks < 65536
 		int task_id = __builtin_ctz(c.d->ready_tasks); // FIXME arbitrary selection for now
 		int currPic = c.d->taskPics[task_id];
@@ -592,6 +763,8 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		if (c.thread_id < 0)
 			return (void *)ret;
 	}
+	if (c.thread_id >= 0)
+		pthread_mutex_unlock(&c.d->lock);
 	return NULL;
 }
 
@@ -1025,8 +1198,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	
 	// Compute Top/BottomFieldOrderCnt (8.2.1), and FrameNum after the last possible unset_currPic
 	int TopFieldOrderCnt, BottomFieldOrderCnt;
+	int64_t lifecycle_order = 0;
+	int pic_order_cnt_lsb = 0;
 	if (sps->pic_order_cnt_type == 0) {
-		int pic_order_cnt_lsb = get_uv(&dec->gb, sps->log2_max_pic_order_cnt_lsb);
+		pic_order_cnt_lsb = get_uv(&dec->gb, sps->log2_max_pic_order_cnt_lsb);
 		int shift = WORD_BIT - sps->log2_max_pic_order_cnt_lsb;
 		if (dec->currPic >= 0 && pic_order_cnt_lsb != ((unsigned)dec->TopFieldOrderCnt << shift >> shift))
 			unset_currPic(dec);
@@ -1036,6 +1211,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		int prevPicOrderCnt = dec->prevPicOrderCnt[non_base_view];
 		int inc = (pic_order_cnt_lsb - prevPicOrderCnt) << shift >> shift;
 		BottomFieldOrderCnt = TopFieldOrderCnt = prevPicOrderCnt + inc;
+		if (dec->currPic >= 0)
+			lifecycle_order = dec->MvcLifecycleOrder[dec->currPic];
+		else
+			lifecycle_order = assign_mvc_lifecycle_order(dec, sps, pic_order_cnt_lsb);
 		log_dec(dec, "  pic_order_cnt: {type: 0, bits: %u, absolute: %d",
 			sps->log2_max_pic_order_cnt_lsb, TopFieldOrderCnt);
 		if (t->pps.bottom_field_pic_order_in_frame_present_flag && !t->field_pic_flag) {
@@ -1070,6 +1249,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 				sps->PicOrderCntDeltas[(absFrameNum - 1) % sps->num_ref_frames_in_pic_order_cnt_cycle];
 		}
 		BottomFieldOrderCnt = TopFieldOrderCnt + sps->offset_for_top_to_bottom_field + delta_pic_order_cnt1;
+		lifecycle_order = TopFieldOrderCnt;
 		log_dec(dec, (TopFieldOrderCnt == BottomFieldOrderCnt) ?
 			", absolute: %d}\n" : ", absolute: %d, bottom: %d}\n",
 			TopFieldOrderCnt, BottomFieldOrderCnt);
@@ -1077,16 +1257,24 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		int PrevRefFrameNum = dec->PrevRefFrameNum[non_base_view];
 		dec->FrameNum = PrevRefFrameNum + 1 + ((frame_num - PrevRefFrameNum - 1) & FrameNumMask);
 		TopFieldOrderCnt = BottomFieldOrderCnt = dec->FrameNum * 2 + (dec->nal_ref_idc != 0) - 1;
+		lifecycle_order = TopFieldOrderCnt;
 		log_dec(dec, "  pic_order_cnt: {type: 2, absolute: %d}\n", TopFieldOrderCnt);
 	}
 	dec->TopFieldOrderCnt = TopFieldOrderCnt;
 	dec->BottomFieldOrderCnt = BottomFieldOrderCnt;
+
+	// IDR resets FrameNum to 0 (H.264 spec 7.4.3)
+	if (dec->IdrPicFlag) {
+		dec->FrameNum = 0;
+		dec->PrevRefFrameNum[non_base_view] = 0;
+	}
+
 	log_dec(dec, "  frame_num: {bits: %u, absolute: %u}\n",
 		sps->log2_max_frame_num, dec->FrameNum);
-	
+
 	// check for gaps in frame_num (8.2.5.2)
 	int gap = dec->FrameNum - dec->PrevRefFrameNum[non_base_view];
-	if (__builtin_expect(gap > 1, 0)) {
+	if (__builtin_expect(gap > 1, 0) && !dec->IdrPicFlag) {
 		// make enough non-reference slots by dereferencing short-term and non-existing frames
 		int sref_slots = sps->max_num_ref_frames - __builtin_popcount(same_views & dec->prev_long_term_frames & ~dec->prev_short_term_frames);
 		assert(sref_slots > 0);
@@ -1110,7 +1298,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			return ENOBUFS; // exit here if we must wait for get_frame to consume and return enough frames
 		// wait until enough empty slots are undepended
 		unsigned unavail;
-		while (non_existing + __builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) > 32)
+		while (non_existing + __builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec) | active_task_frames(dec)) > 32)
 			pthread_cond_wait(&dec->task_complete, &dec->lock);
 		// finally insert the last non-existing frames one by one
 		for (unsigned FrameNum = dec->FrameNum - non_existing; FrameNum < dec->FrameNum; FrameNum++) {
@@ -1123,19 +1311,22 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			dec->prev_long_term_frames |= 1 << i;
 			dec->non_base_frames = dec->non_base_frames & ~(1 << i) | non_base_view << i;
 			dec->FrameNums[i] = dec->PrevRefFrameNum[non_base_view] = FrameNum;
-			dec->FrameIds[i] = ++dec->prevFrameId;
-			int PicOrderCnt = 0;
-			if (sps->pic_order_cnt_type == 2) {
-				PicOrderCnt = FrameNum * 2;
-			} else if (sps->num_ref_frames_in_pic_order_cnt_cycle > 0) {
+				dec->FrameIds[i] = ++dec->prevFrameId;
+				int PicOrderCnt = 0;
+				if (sps->pic_order_cnt_type == 2) {
+					PicOrderCnt = FrameNum * 2;
+				} else if (sps->num_ref_frames_in_pic_order_cnt_cycle > 0) {
 				PicOrderCnt = (FrameNum / sps->num_ref_frames_in_pic_order_cnt_cycle) *
 					sps->PicOrderCntDeltas[sps->num_ref_frames_in_pic_order_cnt_cycle] +
 					sps->PicOrderCntDeltas[FrameNum % sps->num_ref_frames_in_pic_order_cnt_cycle];
+				}
+				dec->FieldOrderCnt[0][i] = dec->FieldOrderCnt[1][i] = PicOrderCnt;
+				dec->MvcLifecycleOrder[i] = PicOrderCnt;
+				dec->HaveMvcPicOrderCntLsb[i] = 0;
+				dec->MvcPicOrderCntLsb[i] = 0;
+				dec->remaining_mbs[i] = 0;
+				dec->next_deblock_addr[i] = INT_MAX;
 			}
-			dec->FieldOrderCnt[0][i] = dec->FieldOrderCnt[1][i] = PicOrderCnt;
-			dec->remaining_mbs[i] = 0;
-			dec->next_deblock_addr[i] = INT_MAX;
-		}
 	}
 	
 	// find and possibly allocate a memory slot for the upcoming frame
@@ -1145,7 +1336,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			return ENOBUFS; // exit here if we must wait for get_frame to consume and return a frame slot
 		// wait until at least one empty slot is undepended (or returned in the meantime)
 		unsigned unavail;
-		while (__builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) >= 32)
+		while (__builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec) | active_task_frames(dec)) >= 32)
 			pthread_cond_wait(&dec->task_complete, &dec->lock);
 		int currPic = __builtin_ctz(~unavail);
 		if (dec->samples_buffers[currPic] == NULL &&
@@ -1158,6 +1349,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		dec->FrameNums[currPic] = dec->FrameNum;
 		dec->FieldOrderCnt[0][currPic] = dec->TopFieldOrderCnt;
 		dec->FieldOrderCnt[1][currPic] = dec->BottomFieldOrderCnt;
+		dec->MvcLifecycleOrder[currPic] = lifecycle_order;
 		dec->remaining_mbs[currPic] = sps->pic_width_in_mbs * sps->pic_height_in_mbs;
 		dec->next_deblock_addr[currPic] = 0;
 		log_dec(dec, "  FrameId: %u\n", dec->FrameIds[currPic]);
@@ -1227,20 +1419,21 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		unsigned long_term_frames = dec->prev_long_term_frames & ~same_views | dec->long_term_frames;
 		unsigned reference_frames = short_term_frames | long_term_frames;
 		assert(__builtin_popcount(reference_frames & same_views) <= sps->max_num_ref_frames);
-		assert(__builtin_popcount(reference_frames | dec->to_get_frames & ~dec->output_frames & ~same_views) <= sps->max_dec_frame_buffering);
+		assert(count_buffered_view_frames(dec, reference_frames, non_base_view) <= sps->max_dec_frame_buffering);
 		int max_bump = sps->max_num_ref_frames;
 		if (!dec->nal_ref_idc) {
 			max_bump = 0;
 			for (unsigned o = dec->to_get_frames & ~dec->output_frames & same_views; o; o &= o - 1)
-				max_bump += dec->FieldOrderCnt[0][__builtin_ctz(o)] < dec->TopFieldOrderCnt;
+				max_bump += picture_order_key(dec, __builtin_ctz(o)) < picture_order_key(dec, dec->currPic);
 		}
-		while (__builtin_popcount(reference_frames | dec->to_get_frames & ~dec->output_frames) > sps->max_dec_frame_buffering && max_bump--)
+		while (count_buffered_view_frames(dec, reference_frames, non_base_view) > sps->max_dec_frame_buffering && max_bump--)
 			bump_frame(dec, non_base_view, 0);
 		dec->to_get_frames |= 1 << dec->currPic;
 		if (max_bump < 0) {
-			dec->output_frames |= 1 << dec->currPic;
-			dec->get_frame_queue_v[non_base_view] = shrd128(set8(dec->currPic), dec->get_frame_queue_v[non_base_view], 15);
-		} else if (__builtin_popcount(dec->to_get_frames & ~dec->output_frames) > sps->max_num_reorder_frames) {
+			log_mvc_queue_event(dec, "direct", non_base_view, dec->currPic, "queue", -1, "max_bump");
+			queue_output_frame(dec, non_base_view, dec->currPic);
+			try_queue_matching_view_frame(dec, "direct", non_base_view, dec->currPic);
+		} else if (count_pending_view_frames(dec, non_base_view) > sps->max_num_reorder_frames) {
 			bump_frame(dec, non_base_view, 0);
 		}
 		#ifdef LOGS
@@ -1475,6 +1668,21 @@ int ADD_VARIANT(parse_pic_parameter_set)(Edge264Decoder *dec,  Edge264UnrefCb un
 			pps.transform_8x8_mode_flag);
 		pps.pic_scaling_matrix_present_flag = get_u1(&dec->gb);
 		if (pps.pic_scaling_matrix_present_flag) {
+			// Pre-initialize PPS scaling lists with correct fallback values
+			// per H.264 Table 7-2 Fall-Back Rule B:
+			// - If seq_scaling_matrix_present_flag: fall back to SPS lists
+			// - Else: fall back to JVT default (non-flat) matrices
+			if (dec->sps.seq_scaling_matrix_present_flag) {
+				memcpy(pps.weightScale4x4_v, dec->sps.weightScale4x4_v, sizeof(pps.weightScale4x4_v));
+				memcpy(pps.weightScale8x8_v, dec->sps.weightScale8x8_v, sizeof(pps.weightScale8x8_v));
+			} else {
+				pps.weightScale4x4_v[0] = Default_4x4_Intra;
+				pps.weightScale4x4_v[3] = Default_4x4_Inter;
+				for (int i = 0; i < 4; i++) {
+					pps.weightScale8x8_v[i] = Default_8x8_Intra[i];
+					pps.weightScale8x8_v[4 + i] = Default_8x8_Inter[i];
+				}
+			}
 			log_dec(dec, "  pic_scaling_matrix:\n");
 			parse_scaling_lists(dec, pps.weightScale4x4_v, pps.weightScale8x8_v, pps.transform_8x8_mode_flag, dec->sps.chroma_format_idc);
 		}
@@ -1878,7 +2086,8 @@ int ADD_VARIANT(parse_seq_parameter_set)(Edge264Decoder *dec, Edge264UnrefCb unr
 			"  qpprime_y_zero_transform_bypass_flag: %u%s\n",
 			sps.BitDepth_Y, sps.BitDepth_C, unsup_if(sps.BitDepth_Y + sps.BitDepth_Y != 16),
 			sps.qpprime_y_zero_transform_bypass_flag, unsup_if(sps.qpprime_y_zero_transform_bypass_flag));
-		if (get_u1(&dec->gb)) { // seq_scaling_matrix_present_flag
+		sps.seq_scaling_matrix_present_flag = get_u1(&dec->gb);
+		if (sps.seq_scaling_matrix_present_flag) {
 			sps.weightScale4x4_v[0] = Default_4x4_Intra;
 			sps.weightScale4x4_v[3] = Default_4x4_Inter;
 			for (int i = 0; i < 4; i++) {
@@ -1995,7 +2204,11 @@ int ADD_VARIANT(parse_seq_parameter_set)(Edge264Decoder *dec, Edge264UnrefCb unr
 			return print_dec(dec, "  decode_NAL_result: %s\n", ENOTSUP); // we shouldn't parse any further thus exit now
 		if (get_u1(&dec->gb))
 			parse_mvc_vui_parameters_extension(dec, &sps);
-		get_u1(&dec->gb);
+		get_u1(&dec->gb); // additional_extension2_flag
+		// Skip any remaining bits until rbsp_trailing_bits (for forward compatibility)
+		// This handles additional_extension2_data and unrecognized VUI data
+		while (!rbsp_end(&dec->gb, 1))
+			get_u1(&dec->gb);
 	}
 	
 	// check if the SPS can be committed

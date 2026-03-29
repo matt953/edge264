@@ -1,3 +1,6 @@
+#if !defined(__APPLE__) && !defined(__MACH__)
+#include <malloc.h>
+#endif
 /** MAYDO:
  * _ receiving a different SPS should reset SSPS
  * _ Replace P and INIT_P with PX versions
@@ -140,7 +143,7 @@ static int unsup_NAL(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_a
 
 
 Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg) {
-	Edge264Decoder *dec = aligned_alloc(64, sizeof(*dec)); // maximal SIMD type alignment used in edge264
+	Edge264Decoder *dec = aligned_alloc(64, (sizeof(*dec) + 63) & ~(size_t)63); // maximal SIMD type alignment used in edge264
 	if (dec == NULL)
 		return NULL;
 	memset(dec, 0, sizeof(*dec));
@@ -148,6 +151,11 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 	dec->currPic = dec->basePic = -1;
 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = dec->prevFrameId = -1;
 	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
+	dec->mvc_reorder_base_v = dec->mvc_reorder_dep_v = set8(-1);
+	dec->mvc_last_empty_sig = ~0u;
+	dec->MvcOrderEpochMaxRelativeOrder = -2;
+	for (int i = 0; i < 16; ++i)
+		dec->mvc_reorder_key[i] = INT64_MAX;
 	dec->n_threads = n_threads;
 	dec->alloc_cb = alloc_cb && free_cb ? alloc_cb : internal_alloc;
 	dec->free_cb = alloc_cb && free_cb ? free_cb : internal_free;
@@ -160,7 +168,9 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 	for (int i = 0; i < 32; i++)
 		dec->parse_nal_unit[i] = unsup_NAL;
 	dec->parse_nal_unit[1] = dec->parse_nal_unit[5] = ADD_VARIANT(parse_slice_layer_without_partitioning);
-	dec->parse_nal_unit[6] = dec->parse_nal_unit[9] = dec->parse_nal_unit[11] = dec->parse_nal_unit[12] = ignore_NAL;
+	dec->parse_nal_unit[0] = dec->parse_nal_unit[6] = dec->parse_nal_unit[9] = dec->parse_nal_unit[11] = dec->parse_nal_unit[12] = ignore_NAL;
+	for (int i = 24; i < 32; i++)
+		dec->parse_nal_unit[i] = ignore_NAL;
 	dec->parse_nal_unit[7] = dec->parse_nal_unit[15] = ADD_VARIANT(parse_seq_parameter_set);
 	dec->parse_nal_unit[8] = ADD_VARIANT(parse_pic_parameter_set);
 	dec->parse_nal_unit[10] = parse_end_of_sequence;
@@ -201,6 +211,7 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 		if (log_cb) {
 			for (int i = 0; i < 32; i++)
 				dec->parse_nal_unit[i] = unsup_NAL_log;
+			dec->parse_nal_unit[0] = ignore_NAL_log;
 			dec->parse_nal_unit[1] = dec->parse_nal_unit[5] = parse_slice_layer_without_partitioning_log;
 			dec->parse_nal_unit[6] = parse_sei_log;
 			dec->parse_nal_unit[7] = dec->parse_nal_unit[15] = parse_seq_parameter_set_log;
@@ -209,6 +220,8 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 			dec->parse_nal_unit[10] = parse_end_of_sequence_log;
 			dec->parse_nal_unit[11] = dec->parse_nal_unit[12] = ignore_NAL_log;
 			dec->parse_nal_unit[14] = dec->parse_nal_unit[20] = parse_nal_unit_header_extension_log;
+			for (int i = 24; i < 32; i++)
+				dec->parse_nal_unit[i] = ignore_NAL_log;
 			if (log_mbs)
 				dec->worker_loop = worker_loop_log;
 		}
@@ -240,8 +253,12 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 					if (i == n_threads) {
 						return dec;
 					}
+					pthread_mutex_lock(&dec->lock);
+					dec->shutdown = 1;
+					pthread_cond_broadcast(&dec->task_ready);
+					pthread_mutex_unlock(&dec->lock);
 					while (i-- > 0)
-						pthread_cancel(dec->threads[i]);
+						pthread_join(dec->threads[i], NULL);
 					pthread_cond_destroy(&dec->task_complete);
 				}
 				pthread_cond_destroy(&dec->task_progress);
@@ -274,8 +291,13 @@ void edge264_free(Edge264Decoder **pdec) {
 	if (pdec != NULL && (dec = *pdec) != NULL) {
 		*pdec = NULL;
 		if (dec->n_threads) {
+			// Signal worker threads to exit and wait for them
+			pthread_mutex_lock(&dec->lock);
+			dec->shutdown = 1;
+			pthread_cond_broadcast(&dec->task_ready);
+			pthread_mutex_unlock(&dec->lock);
 			for (int i = 0; i < dec->n_threads; i++)
-				pthread_cancel(dec->threads[i]);
+				pthread_join(dec->threads[i], NULL);
 			pthread_mutex_destroy(&dec->lock);
 			pthread_cond_destroy(&dec->task_ready);
 			pthread_cond_destroy(&dec->task_progress);
@@ -373,7 +395,156 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 	return ret;
 }
 
+static unsigned edge264_view_mask(const Edge264Decoder *dec, int non_base_view) {
+	return non_base_view ? dec->non_base_frames : ~dec->non_base_frames;
+}
 
+static unsigned edge264_count_pending_view_frames(const Edge264Decoder *dec, int non_base_view) {
+	return __builtin_popcount(dec->to_get_frames & ~dec->output_frames & edge264_view_mask(dec, non_base_view));
+}
+
+static unsigned edge264_count_queued_view_frames(const Edge264Decoder *dec, int non_base_view) {
+	unsigned count = 0;
+	for (int i = 0; i < 16; ++i)
+		count += dec->get_frame_queue[non_base_view][i] >= 0;
+	return count;
+}
+
+static unsigned edge264_count_mvc_reorder_pairs(const Edge264Decoder *dec) {
+	unsigned count = 0;
+	for (int i = 0; i < 16; ++i)
+		count += dec->mvc_reorder_base[i] >= 0;
+	return count;
+}
+
+static unsigned edge264_count_ready_view_frames(const Edge264Decoder *dec, int non_base_view) {
+	unsigned count = 0;
+	for (int i = 0; i < 16; ++i) {
+		int pic = dec->get_frame_queue[non_base_view][i];
+		if (pic >= 0 && dec->next_deblock_addr[pic] == INT_MAX)
+			++count;
+	}
+	return count;
+}
+
+static int edge264_first_ready_view_key(const Edge264Decoder *dec, int non_base_view) {
+	for (int i = 0; i < 16; ++i) {
+		int pic = dec->get_frame_queue[non_base_view][i];
+		if (pic >= 0 && dec->next_deblock_addr[pic] == INT_MAX)
+			return (int)dec->MvcLifecycleOrder[pic];
+	}
+	return -1;
+}
+
+static void edge264_log_mvc_get_frame(Edge264Decoder *dec, const char *event, unsigned reorder_pairs, long long lowest_key, int reorder_idx, int can_flush) {
+	if (!dec->ssps.BitDepth_Y || !dec->log_cb)
+		return;
+	char msg[256];
+	snprintf(msg, sizeof(msg),
+		"edge264 mvc get: event=%s reorderPairs=%u lowestKey=%lld idx=%d started=%d maxReorder=%d canFlush=%d queued={b:%u,d:%u} ready={b:%u,d:%u} firstReady={b:%d,d:%d}\n",
+		event, reorder_pairs, lowest_key, reorder_idx, dec->HaveMvcReorderStarted,
+		dec->sps.max_num_reorder_frames, can_flush,
+		edge264_count_queued_view_frames(dec, 0), edge264_count_queued_view_frames(dec, 1),
+		edge264_count_ready_view_frames(dec, 0), edge264_count_ready_view_frames(dec, 1),
+		edge264_first_ready_view_key(dec, 0), edge264_first_ready_view_key(dec, 1));
+	dec->log_cb(msg, dec->log_arg);
+}
+
+static uint32_t edge264_mvc_queue_sig(const Edge264Decoder *dec) {
+	uint32_t sig = 2166136261u;
+	for (int view = 0; view < 2; ++view) {
+		for (int i = 0; i < 16; ++i) {
+			int pic = dec->get_frame_queue[view][i];
+			uint32_t v = 0xffu;
+			if (pic >= 0) {
+				int next = dec->next_deblock_addr[pic];
+				v = (uint32_t)(dec->MvcLifecycleOrder[pic] & 0xffff);
+				v ^= (uint32_t)(next == INT_MAX ? 0xffffu : (uint32_t)(next & 0xffff));
+			}
+			sig ^= v + (uint32_t)(view * 17 + i);
+			sig *= 16777619u;
+		}
+	}
+	return sig;
+}
+
+static void edge264_log_mvc_empty_state(Edge264Decoder *dec, unsigned reorder_pairs, int can_flush) {
+	if (!dec->ssps.BitDepth_Y || !dec->log_cb)
+		return;
+	unsigned queued_base = edge264_count_queued_view_frames(dec, 0);
+	unsigned queued_dep = edge264_count_queued_view_frames(dec, 1);
+	if (!queued_base && !queued_dep)
+		return;
+	uint32_t sig = edge264_mvc_queue_sig(dec);
+	if (sig == dec->mvc_last_empty_sig)
+		return;
+	dec->mvc_last_empty_sig = sig;
+	char msg[320];
+	snprintf(msg, sizeof(msg),
+		"edge264 mvc get: event=empty reorderPairs=%u started=%d maxReorder=%d canFlush=%d queued={b:%u,d:%u} ready={b:%u,d:%u} firstReady={b:%d,d:%d} tasks={p:0x%04x,r:0x%04x,b:0x%04x}\n",
+		reorder_pairs, dec->HaveMvcReorderStarted, dec->sps.max_num_reorder_frames, can_flush,
+		queued_base, queued_dep,
+		edge264_count_ready_view_frames(dec, 0), edge264_count_ready_view_frames(dec, 1),
+		edge264_first_ready_view_key(dec, 0), edge264_first_ready_view_key(dec, 1),
+		dec->pending_tasks, dec->ready_tasks, dec->busy_tasks);
+	dec->log_cb(msg, dec->log_arg);
+}
+
+/*
+ * Extra matched-pair holdback beyond max_num_reorder_frames.
+ *
+ * Default to +1 because that is stable for the practical 3+ thread cases.
+ * 2-thread startup/order sensitivity benefits from +2, but even +2 was not
+ * perfectly clean in testing, so keep the safer general default here.
+ */
+#define EDGE264_MVC_EXTRA_REORDER_HOLDBACK 1
+
+static void edge264_drain_mvc_reorder_queue(Edge264Decoder *dec) {
+	while (edge264_count_mvc_reorder_pairs(dec) < 16) {
+		int best_idx0 = -1;
+		int best_idx1 = -1;
+		int best_pic0 = -1;
+		int best_pic1 = -1;
+		int64_t best_key = INT64_MAX;
+		for (int i = 0; i < 16; ++i) {
+			int queued0 = dec->get_frame_queue[0][i];
+			if (queued0 < 0 || dec->next_deblock_addr[queued0] != INT_MAX)
+				continue;
+			int64_t key = dec->MvcLifecycleOrder[queued0];
+			for (int j = 0; j < 16; ++j) {
+				int queued1 = dec->get_frame_queue[1][j];
+				if (queued1 < 0 || dec->next_deblock_addr[queued1] != INT_MAX)
+					continue;
+				if (dec->MvcLifecycleOrder[queued1] != key)
+					continue;
+				if (best_idx0 >= 0 && key >= best_key)
+					break;
+				best_idx0 = i;
+				best_idx1 = j;
+				best_pic0 = queued0;
+				best_pic1 = queued1;
+				best_key = key;
+				break;
+			}
+		}
+		if (best_idx0 < 0 || best_idx1 < 0)
+			break;
+		if (!queue_reorder_pair(dec, best_pic0, best_pic1))
+			break;
+		dec->get_frame_queue[0][best_idx0] = -1;
+		dec->get_frame_queue[1][best_idx1] = -1;
+	}
+}
+
+static int edge264_mvc_can_flush_reorder_queue(const Edge264Decoder *dec) {
+	if (edge264_count_pending_view_frames(dec, 0) || edge264_count_pending_view_frames(dec, 1))
+		return 0;
+	for (int view = 0; view < 2; ++view)
+		for (int i = 0; i < 16; ++i)
+			if (dec->get_frame_queue[view][i] >= 0)
+				return 0;
+	return 1;
+}
 
 /**
  * By default all frames with POC lower or equal with the last non-reference
@@ -387,13 +558,65 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 		return EINVAL;
 	if (dec->n_threads)
 		pthread_mutex_lock(&dec->lock);
-	int idx0 = __builtin_ctz(movemask(dec->get_frame_queue_v[0]) | 1 << 16) - 1;
-	int idx1 = __builtin_ctz(movemask(dec->get_frame_queue_v[1]) | 1 << 16) - 1;
-	int pic0, pic1, res = ENOMSG;
-	if (idx0 >= 0 && dec->next_deblock_addr[pic0 = dec->get_frame_queue[0][idx0]] == INT_MAX &&
-		(dec->ssps.BitDepth_Y == 0 || (idx1 >= 0 && dec->next_deblock_addr[pic1 = dec->get_frame_queue[1][idx1]] == INT_MAX))) {
+	int pic0 = -1;
+	int pic1 = -1;
+	int res = ENOMSG;
+	int borrow_frame = borrow != 0;
+	int force_flush = borrow == 2;
+	if (dec->ssps.BitDepth_Y != 0)
+		edge264_drain_mvc_reorder_queue(dec);
+	if (dec->ssps.BitDepth_Y != 0) {
+		int reorder_idx = -1;
+		int64_t lowest_key = INT64_MAX;
+		int first_incomplete_base_key;
+		unsigned reorder_pairs = edge264_count_mvc_reorder_pairs(dec);
+		int can_flush = edge264_mvc_can_flush_reorder_queue(dec);
+		if (reorder_pairs == 0) {
+			edge264_log_mvc_empty_state(dec, reorder_pairs, can_flush);
+			goto out;
+		}
+		dec->mvc_last_empty_sig = ~0u;
+		if (!force_flush && dec->HaveMvcReorderStarted &&
+		    reorder_pairs <= (unsigned)(dec->sps.max_num_reorder_frames +
+		                                EDGE264_MVC_EXTRA_REORDER_HOLDBACK) &&
+		    !can_flush) {
+			edge264_log_mvc_get_frame(dec, "hold", reorder_pairs, -1, -1, can_flush);
+			goto out;
+		}
+		for (int i = 0; i < 16; ++i) {
+			int queued = dec->mvc_reorder_base[i];
+			if (queued < 0)
+				continue;
+			int64_t key = dec->mvc_reorder_key[i];
+			if (reorder_idx >= 0 && key >= lowest_key)
+				continue;
+			reorder_idx = i;
+			pic0 = queued;
+			pic1 = dec->mvc_reorder_dep[i];
+			lowest_key = key;
+		}
+		if (reorder_idx < 0 || pic0 < 0 || pic1 < 0) {
+			edge264_log_mvc_get_frame(dec, "nomatch", reorder_pairs, -1, reorder_idx, can_flush);
+			goto out;
+		}
+		first_incomplete_base_key = edge264_first_ready_view_key(dec, 0);
+		if (!force_flush && !can_flush && first_incomplete_base_key >= 0 && first_incomplete_base_key < lowest_key) {
+			edge264_log_mvc_get_frame(dec, "hold", reorder_pairs, lowest_key, reorder_idx, can_flush);
+			goto out;
+		}
+		edge264_log_mvc_get_frame(dec, "emit", reorder_pairs, lowest_key, reorder_idx, can_flush);
+		dec->mvc_reorder_base[reorder_idx] = -1;
+		dec->mvc_reorder_dep[reorder_idx] = -1;
+		dec->mvc_reorder_key[reorder_idx] = INT64_MAX;
+		dec->HaveMvcReorderStarted = 1;
+	} else {
+		int idx0 = __builtin_ctz(movemask(dec->get_frame_queue_v[0]) | 1 << 16) - 1;
+		if (idx0 < 0 || dec->next_deblock_addr[pic0 = dec->get_frame_queue[0][idx0]] != INT_MAX)
+			goto out;
 		dec->get_frame_queue[0][idx0] = -1;
-		memcpy(out, &dec->out, sizeof(*out)); // GCC-14 crashes on dec->out = format
+	}
+	if (pic0 >= 0) {
+		memcpy(out, &dec->out, sizeof(*out));
 		int top = dec->out.frame_crop_offsets[0];
 		int left = dec->out.frame_crop_offsets[3];
 		int offY = top * dec->out.stride_Y + (dec->out.bit_depth_Y == 8 ? left : left << 1);
@@ -406,21 +629,27 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 		out->samples[1] = dec->samples_buffers[pic0] + offC;
 		out->samples[2] = dec->samples_buffers[pic0] + offC + (dec->out.stride_C >> 1);
 		out->FrameId = dec->FrameIds[pic0];
+		out->Poc = dec->FieldOrderCnt[0][pic0];
+		out->Poc_mvc = 0;
+		out->DisplayPoc = dec->ssps.BitDepth_Y ? dec->MvcLifecycleOrder[pic0] : out->Poc;
+		out->DisplayPoc_mvc = 0;
 		out->return_arg = (void *)((uintptr_t)1 << pic0);
-		if (idx1 >= 0) {
-			dec->get_frame_queue[1][idx1] = -1;
+		if (pic1 >= 0) {
 			assert(dec->to_get_frames & dec->output_frames & 1 << pic1);
 			dec->to_get_frames ^= 1 << pic1;
 			out->samples_mvc[0] = dec->samples_buffers[pic1] + offY;
 			out->samples_mvc[1] = dec->samples_buffers[pic1] + offC;
 			out->samples_mvc[2] = dec->samples_buffers[pic1] + offC + (dec->out.stride_C >> 1);
 			out->FrameId_mvc = dec->FrameIds[pic1];
+			out->Poc_mvc = dec->FieldOrderCnt[0][pic1];
+			out->DisplayPoc_mvc = dec->ssps.BitDepth_Y ? dec->MvcLifecycleOrder[pic1] : out->Poc_mvc;
 			out->return_arg = (void *)((uintptr_t)1 << pic0 | (uintptr_t)1 << pic1);
 		}
 		res = 0;
-		if (!borrow)
+		if (!borrow_frame)
 			dec->output_frames &= ~(uintptr_t)out->return_arg;
 	}
+out:
 	if (dec->n_threads)
 		pthread_mutex_unlock(&dec->lock);
 	return res;
