@@ -1452,6 +1452,16 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		#endif
 	}
 	
+	// Serialize same-frame slices: wait for any busy task on the same currPic to complete.
+	// This prevents cross-slice deblocking races where mbB data from the previous slice
+	// hasn't been written yet. Inter-frame parallelism (different currPic) is unaffected.
+	for (unsigned tasks = dec->busy_tasks; tasks; tasks &= tasks - 1) {
+		if (dec->taskPics[__builtin_ctz(tasks)] == dec->currPic) {
+			pthread_cond_wait(&dec->task_complete, &dec->lock);
+			tasks = dec->busy_tasks; // re-scan after waking
+		}
+	}
+
 	// prepare the task and signal it
 	initialize_task(dec, sps, t);
 	int task_id = t - dec->tasks;
