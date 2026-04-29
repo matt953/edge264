@@ -1,6 +1,17 @@
 #if !defined(__APPLE__) && !defined(__MACH__)
 #include <malloc.h>
 #endif
+
+// Android (Bionic) doesn't provide aligned_alloc until API 28.
+// FFmpeg's Android builds target API 26, so we need a fallback.
+#if defined(__ANDROID__) && __ANDROID_API__ < 28
+#include <stdlib.h>
+static void *aligned_alloc(size_t alignment, size_t size) {
+	void *ptr = NULL;
+	return posix_memalign(&ptr, alignment, size) == 0 ? ptr : NULL;
+}
+#endif
+
 /** MAYDO:
  * _ receiving a different SPS should reset SSPS
  * _ Replace P and INIT_P with PX versions
